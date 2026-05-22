@@ -1,0 +1,24 @@
+# Large video files
+*.mp4
+*.avi
+*.mov
+
+# Model checkpoints (large)
+checkpoints/
+logs/
+*.pt
+*.pth
+*.safetensors
+
+# Output videos
+output_*.mp4
+eval_viz/
+annotation_check/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Docs build
+docs/_build/
+.superpowers/
