@@ -1,8 +1,7 @@
 """Real-time runway detector inference pipeline with HRNet-Offset + EKF.
 
-Uses PnP prior to crop ROI around runway (256x256), feeds RGB + PnP heatmaps
-as 7-channel input to HRNet-Offset for corner refinement, then applies
-SE(3)-EKF for temporal smoothing.
+Uses PnP prior to crop ROI around runway (256x256), feeds RGB crop to
+HRNet-Offset for corner refinement, then applies SE(3)-EKF for temporal smoothing.
 
 Usage:
     detector = RunwayInference()
@@ -11,29 +10,22 @@ Usage:
 """
 
 import os
-import sys
 import numpy as np
 import torch
 import cv2
 from typing import Optional
 
-# Import detection project's model and utilities
-_DETECTION_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "..", "detection")
-sys.path.insert(0, _DETECTION_ROOT)
-from runway_detection.config import Config
-from runway_detection.models.hrnet_offset import HRNetOffset
-from runway_detection.dataset import (compute_crop_region, crop_and_resize,
-                                       transform_points, generate_heatmaps)
-
+from .models.hrnet_detection import HRNetOffsetDetector
+from .data.crop_utils import (compute_crop_region, crop_and_resize,
+                               transform_points, generate_heatmaps)
 from .config import ORIGINAL_SIZE
 from .filtering.ekf import SE3EKF
 from .filtering.measurement_model import CornerMeasurementModel
 
-# Default checkpoint: best HRNet-Offset model
+# Default checkpoint: best HRNet-Offset model (copied from detection project)
 DEFAULT_CHECKPOINT = os.path.join(
-    _DETECTION_ROOT,
-    "runway_detection/checkpoints/hrnet_offset_20260522_090825/best_model.pt",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "checkpoints", "hrnet_offset_best.pt",
 )
 
 
@@ -57,22 +49,21 @@ class RunwayInference:
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        # Load HRNet-Offset model
+        # Load HRNet-Offset model (local, no detection-project dependency)
         ckpt_path = checkpoint_path or DEFAULT_CHECKPOINT
-        config = Config()
-        config.model.name = "hrnet_offset"
-        config.model.out_channels = 4  # one heatmap per corner
-        config.model.backbone = "hrnet_w18_small_v2.ms_in1k"
-        config.model.pretrained_dir = os.path.join(_DETECTION_ROOT, "pretrained")
-
-        # Auto-detect in_channels from checkpoint
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         ckpt_cfg = ckpt.get("config", {})
-        config.model.in_channels = ckpt_cfg.get("model", {}).get("in_channels", 3)
-        self.model = HRNetOffset(config).to(self.device)
+        in_channels = ckpt_cfg.get("model", {}).get("in_channels", 3)
+
+        self.model = HRNetOffsetDetector(
+            model_name="hrnet_w18_small_v2.ms_in1k",
+            in_channels=in_channels,
+            out_channels=4,
+            pretrained=False,
+        ).to(self.device)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.eval()
-        self.crop_size = config.data.crop_size  # 256
+        self.crop_size = ckpt_cfg.get("data", {}).get("crop_size", 256)
 
         # Measurement model for PnP prior projection
         self.meas_model = CornerMeasurementModel()

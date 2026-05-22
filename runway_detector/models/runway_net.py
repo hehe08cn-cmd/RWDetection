@@ -2,7 +2,7 @@
 
 Architecture:
     Input (B, in_ch, H, W)
-    → HRNet-w18 backbone (features at stride 2)
+    → timm HRNet-w18 backbone (multi-scale fusion to 1/4 resolution)
     → Corner head (DSNT) → heatmaps + coords
     → Edge head → left/right edge heatmaps
     → Centerline head → centerline heatmap
@@ -17,7 +17,7 @@ from .heads.corner_head import DSNTHead
 from .heads.edge_head import EdgeHead
 from .heads.centerline_head import CenterlineHead
 from ..config import (
-    NUM_CORNERS, WORKING_SIZE, HRNET_FEATURE_CHANNELS,
+    NUM_CORNERS, WORKING_SIZE,
     BACKBONE, PRETRAINED,
 )
 
@@ -48,7 +48,7 @@ class RunwayNet(nn.Module):
             pretrained=pretrained,
             in_chans=in_channels,
         )
-        feat_channels = HRNET_FEATURE_CHANNELS
+        feat_channels = self.backbone.out_channels[0]  # 256 (fusion projection)
 
         # Corner head (always active)
         self.corner_head = DSNTHead(

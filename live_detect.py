@@ -16,8 +16,8 @@ W_orig, H_orig = ORIGINAL_SIZE
 SX = 512.0 / W_orig
 SY = 288.0 / H_orig
 
-# Display at half resolution for speed (drawing on 960×540 is 4x faster than 1920×1080)
-DW, DH = W_orig // 2, H_orig // 2
+# Display at full resolution for detail visibility
+DW, DH = W_orig, H_orig  # 1920×1080
 DSX, DSY = DW / 512.0, DH / 288.0
 
 
@@ -36,7 +36,7 @@ def main():
     if args.checkpoint:
         kwargs["checkpoint_path"] = args.checkpoint
     detector = RunwayInference(**kwargs)
-    print(f"  in_channels: {detector.model.config.model.in_channels}")
+    print(f"  model: HRNet-w18-small (3ch RGB input)")
 
     gt_gen = GroundTruthGenerator()
     pose_dict = load_poses_dict(POSES[args.video_key])
@@ -57,7 +57,7 @@ def main():
     print("Keys: q=quit, space=pause, t=toggle tracking, <- ->=step\n")
 
     cv2.namedWindow("Runway Detection", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Runway Detection", 960, 540)
+    cv2.resizeWindow("Runway Detection", DW, DH)
 
     # Pre-seek to first frame and warm up CUDA graph
     first_fi = frames[0] if frames else 0

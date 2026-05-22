@@ -40,9 +40,12 @@ BACKBONE = "hrnet_w18"  # from timm
 PRETRAINED = True
 INPUT_CHANNELS = 3  # RGB only in Stage 1; Stage 3 adds 7ch prior → 10ch total
 
-# HRNet feature extraction
-HRNET_OUT_INDICES = (0,)  # use highest-resolution feature map (stride 2)
-HRNET_FEATURE_CHANNELS = 64  # hrnet_w18 stage 0 output channels
+# HRNet feature extraction (multi-scale fusion matching detection project pattern)
+# Extract all 5 stages, skip stride-2 (feat[0]), upsample+concat lower stages to 1/4
+# timm hrnet_w18_small_v2: feat[1]=128ch(1/4) + feat[2]=256ch(1/8) + feat[3]=512ch(1/16) + feat[4]=1024ch(1/32)
+HRNET_OUT_INDICES = (0, 1, 2, 3, 4)  # all stages, fused in backbone.forward()
+HRNET_FEATURE_CHANNELS = [64, 128, 256, 512, 1024]  # per-stage channel counts
+HRNET_FUSION_CHANNELS = 256  # 1x1 projection after multi-scale concat (reduces 1920ch → 256ch)
 
 # Training
 BATCH_SIZE = 8
