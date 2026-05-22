@@ -138,6 +138,14 @@ class RunwayInference:
         sy = 288.0 / H_orig
         result["corners"] = corners_orig * np.array([sx, sy])
 
+        # Edge and centerline heatmaps (if model has line heads)
+        if "edge_heatmaps" in outputs:
+            result["edge_heatmaps"] = outputs["edge_heatmaps"][0].cpu().numpy()
+            result["centerline_heatmap"] = outputs["centerline_heatmap"][0].cpu().numpy()
+            # Fit lines from heatmaps
+            result["edge_lines"] = self._fit_edge_lines(result["edge_heatmaps"], crop_info)
+            result["centerline"] = self._fit_centerline(result["centerline_heatmap"], crop_info)
+
         # EKF update
         if self.ekf is not None:
             self._ekf_update(result["corners"])
@@ -298,6 +306,101 @@ class RunwayInference:
             state['corners_pred'] = self._predict_corners_from_state()
             return state
         return None
+
+    def _fit_edge_lines(self, edge_hm, crop_info):
+        """Fit left/right edge line parameters from heatmaps.
+
+        Args:
+            edge_hm: (2, 256, 256) edge heatmaps [left, right]
+            crop_info: dict with cx, cy, half
+
+        Returns:
+            dict with 'left' and 'right' line params (a, b, c) in original pixel coords
+        """
+        cx, cy, half = crop_info["cx"], crop_info["cy"], crop_info["half"]
+        lines = {}
+        for idx, label in enumerate(['left', 'right']):
+            hm = edge_hm[idx]
+            line = self._fit_line_from_heatmap(hm)
+            if line is not None:
+                # Map from crop [0, 255] to original image coords
+                # crop_x_pixel = (hm_x * 2*half / 256) + (cx - half)
+                scale = 2.0 * half / 256.0
+                offset_x = cx - half
+                offset_y = cy - half
+                # Map line params: a*x + b*y + c = 0
+                # x_orig = scale * x_crop + offset_x
+                # y_orig = scale * y_crop + offset_y
+                # => a*scale*x_crop + a*offset_x + b*scale*y_crop + b*offset_y + c = 0
+                # => a_orig*x_orig + b_orig*y_orig + c_orig = 0
+                a, b, c = line
+                a_orig = a / scale
+                b_orig = b / scale
+                c_orig = c - a * offset_x / scale - b * offset_y / scale
+                lines[label] = (a_orig, b_orig, c_orig)
+            else:
+                lines[label] = None
+        return lines
+
+    def _fit_centerline(self, cl_hm, crop_info):
+        """Fit centerline from heatmap. Returns (a, b, c) in original pixel coords."""
+        line = self._fit_line_from_heatmap(cl_hm[0])
+        if line is None:
+            return None
+        cx, cy, half = crop_info["cx"], crop_info["cy"], crop_info["half"]
+        a, b, c = line
+        scale = 2.0 * half / 256.0
+        offset_x = cx - half
+        offset_y = cy - half
+        a_orig = a / scale
+        b_orig = b / scale
+        c_orig = c - a * offset_x / scale - b * offset_y / scale
+        return (a_orig, b_orig, c_orig)
+
+    @staticmethod
+    def _fit_line_from_heatmap(hm, threshold=0.3):
+        """Fit line params (a, b, c) from heatmap using weighted PCA.
+
+        Args:
+            hm: (H, W) float heatmap
+            threshold: minimum value to consider a pixel
+
+        Returns:
+            (a, b, c) or None if not enough points
+        """
+        ys, xs = np.where(hm > threshold)
+        if len(ys) < 10:
+            return None
+        weights = hm[ys, xs]
+        total_w = weights.sum()
+        if total_w < 1e-6:
+            return None
+        # Weighted centroid
+        cx = (xs * weights).sum() / total_w
+        cy = (ys * weights).sum() / total_w
+        # Weighted covariance
+        dx = xs - cx
+        dy = ys - cy
+        cov_xx = (dx * dx * weights).sum() / total_w
+        cov_yy = (dy * dy * weights).sum() / total_w
+        cov_xy = (dx * dy * weights).sum() / total_w
+        # PCA: direction is eigenvector of [[cov_xx, cov_xy], [cov_xy, cov_yy]]
+        # Normal direction is perpendicular
+        trace = cov_xx + cov_yy
+        det = cov_xx * cov_yy - cov_xy * cov_xy
+        if det < 1e-12:
+            return None
+        # Eigenvalue for line direction (larger)
+        eigval = trace / 2.0 + np.sqrt(max(0, trace**2 / 4.0 - det))
+        # Normal vector (a, b) is eigenvector of smaller eigenvalue
+        a = cov_xy
+        b = eigval - cov_xx
+        norm = np.sqrt(a**2 + b**2)
+        if norm < 1e-8:
+            return None
+        a, b = a / norm, b / norm
+        c = -(a * cx + b * cy)
+        return (a, b, c)
 
     def _predict_corners_from_state(self) -> Optional[np.ndarray]:
         if not self._ekf_initialized:
