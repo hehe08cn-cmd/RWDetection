@@ -15,17 +15,27 @@ import torch
 import cv2
 from typing import Optional
 
-from .models.hrnet_detection import HRNetOffsetDetector
+from .models.multitask_net import MultiTaskNet
+from .models.scanline_net import ScanlineEdgeNet, predict_to_lines
 from .data.crop_utils import (compute_crop_region, crop_and_resize,
                                transform_points, generate_heatmaps)
-from .config import ORIGINAL_SIZE
+from .config import ORIGINAL_SIZE, FAR_FIELD_ALTITUDE_THRESHOLD
 from .filtering.ekf import SE3EKF
 from .filtering.measurement_model import CornerMeasurementModel
+
+# Runway elevation for AGL computation (average of corner altitudes)
+RUNWAY_ELEVATION = 27.5  # meters
 
 # Default checkpoint: best HRNet-Offset model (copied from detection project)
 DEFAULT_CHECKPOINT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "checkpoints", "hrnet_offset_best.pt",
+)
+
+# Default scanline edge detector checkpoint
+DEFAULT_SCANLINE_CHECKPOINT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "checkpoints", "scanline_net_best.pt",
 )
 
 
@@ -49,21 +59,26 @@ class RunwayInference:
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        # Load HRNet-Offset model (local, no detection-project dependency)
+        # Load HRNet-Offset (frozen backbone + corner head)
         ckpt_path = checkpoint_path or DEFAULT_CHECKPOINT
-        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        ckpt_cfg = ckpt.get("config", {})
-        in_channels = ckpt_cfg.get("model", {}).get("in_channels", 3)
-
-        self.model = HRNetOffsetDetector(
-            model_name="hrnet_w18_small_v2.ms_in1k",
-            in_channels=in_channels,
-            out_channels=4,
-            pretrained=False,
-        ).to(self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.model = MultiTaskNet(ckpt_path, crop_size=256, device=str(self.device))
+        self.model = self.model.to(self.device)
         self.model.eval()
-        self.crop_size = ckpt_cfg.get("data", {}).get("crop_size", 256)
+        self.crop_size = 256
+
+        # Scanline edge detector (MobileNetV3-small, per-row x-coordinate regression)
+        self.scanline_net = None
+        scanline_ckpt = DEFAULT_SCANLINE_CHECKPOINT
+        if os.path.exists(scanline_ckpt):
+            self.scanline_net = ScanlineEdgeNet(crop_size=self.crop_size, freeze_backbone=False)
+            ckpt = torch.load(scanline_ckpt, map_location=self.device, weights_only=False)
+            self.scanline_net.load_state_dict(ckpt["model_state_dict"])
+            self.scanline_net = self.scanline_net.to(self.device)
+            self.scanline_net.eval()
+            print(f"  Loaded scanline net: {scanline_ckpt}")
+        else:
+            print(f"  Scanline checkpoint not found: {scanline_ckpt}, "
+                  f"using corner-derived lines only")
 
         # Measurement model for PnP prior projection
         self.meas_model = CornerMeasurementModel()
@@ -109,8 +124,20 @@ class RunwayInference:
         #   det[0]=our[0], det[1]=our[3], det[2]=our[1], det[3]=our[2]
         prior_det = prior_corners[[0, 3, 1, 2]]
 
+        # Get edge sample points for crop computation (covers full visible runway
+        # even when near corners are outside the image)
+        edge_samples = None
+        prior_edge_lines = None
+        if pose is not None:
+            prior_edge_lines = self.meas_model.projector.project_edge_lines(pose)
+            if prior_edge_lines is not None:
+                pts_list = [prior_edge_lines[k] for k in ['left', 'right']
+                           if prior_edge_lines.get(k) is not None and len(prior_edge_lines[k]) > 0]
+                if pts_list:
+                    edge_samples = np.vstack(pts_list)
+
         # Crop preprocessing (skip PnP heatmaps for 3ch model)
-        img_tensor, _, crop_info = self._preprocess(frame, prior_det)
+        img_tensor, _, crop_info = self._preprocess(frame, prior_det, edge_samples)
 
         # CUDA graph replay (2x faster than regular forward)
         outputs = self._infer(img_tensor)
@@ -129,13 +156,37 @@ class RunwayInference:
         sy = 288.0 / H_orig
         result["corners"] = corners_orig * np.array([sx, sy])
 
-        # Edge and centerline heatmaps (if model has line heads)
-        if "edge_heatmaps" in outputs:
-            result["edge_heatmaps"] = outputs["edge_heatmaps"][0].cpu().numpy()
-            result["centerline_heatmap"] = outputs["centerline_heatmap"][0].cpu().numpy()
-            # Fit lines from heatmaps
-            result["edge_lines"] = self._fit_edge_lines(result["edge_heatmaps"], crop_info)
-            result["centerline"] = self._fit_centerline(result["centerline_heatmap"], crop_info)
+        # PnP-projected edge lines (computed once, reused)
+        if prior_edge_lines:
+            result["prior_edge_lines"] = prior_edge_lines
+
+        # Altitude-gated edge/centerline detection (close-range only)
+        agl = None
+        if pose is not None and 'altitude' in pose:
+            agl = pose['altitude'] - RUNWAY_ELEVATION
+            result["agl"] = agl
+
+        # Scanline edge detection: per-row x-coordinate regression
+        if self.scanline_net is not None:
+            with torch.no_grad():
+                output = self.scanline_net(img_tensor)  # (1, 2, 256) in [-1, 1]
+                output_np = output[0].cpu().numpy()
+            fitted = predict_to_lines(output_np, crop_size=self.crop_size)
+            # Convert line params from crop coords to original image coords
+            cx, cy, half = crop_info["cx"], crop_info["cy"], crop_info["half"]
+            scale = self.crop_size / (2.0 * half)
+            result["scanline_edge_lines"] = {}
+            for name in ["left", "right", "centerline"]:
+                line = fitted.get(name)
+                if line is not None:
+                    a, b, c = line
+                    offset_x = cx - half
+                    offset_y = cy - half
+                    c_orig = c / scale - a * offset_x - b * offset_y
+                    n = np.sqrt(a*a + b*b)
+                    result["scanline_edge_lines"][name] = (a/n, b/n, c_orig/n)
+                else:
+                    result["scanline_edge_lines"][name] = None
 
         # EKF update
         if self.ekf is not None:
@@ -144,8 +195,16 @@ class RunwayInference:
 
         return result
 
-    def _preprocess(self, frame, prior_corners):
+    def _preprocess(self, frame, prior_corners, edge_samples=None):
         """Crop frame around prior and prepare model input.
+
+        Args:
+            frame: BGR image at original resolution
+            prior_corners: (4, 2) PnP-projected corners in detection order
+            edge_samples: (N, 2) PnP-projected edge sample points, or None.
+                          When provided, used for crop computation instead of
+                          corners (covers full visible edge even when near
+                          corners are outside image).
 
         Returns:
             img_tensor: (1, 3, 256, 256) normalized RGB on device
@@ -154,13 +213,20 @@ class RunwayInference:
         """
         h, w = frame.shape[:2]
 
-        # Compute square crop around prior points
-        visible = np.ones(4, dtype=bool)
-        visible[prior_corners[:, 0] < 0] = False
-        cx, cy, half = compute_crop_region(
-            prior_corners, visible, w, h,
-            padding=1.0, min_size=128, max_size=512,
-        )
+        # Compute square crop around runway region
+        if edge_samples is not None and len(edge_samples) > 0:
+            vis = np.ones(len(edge_samples), dtype=bool)
+            cx, cy, half = compute_crop_region(
+                edge_samples, vis, w, h,
+                padding=1.0, min_size=128, max_size=512,
+            )
+        else:
+            visible = np.ones(4, dtype=bool)
+            visible[prior_corners[:, 0] < 0] = False
+            cx, cy, half = compute_crop_region(
+                prior_corners, visible, w, h,
+                padding=1.0, min_size=128, max_size=512,
+            )
 
         # Crop and resize to 256x256 (BGR->RGB in one step)
         crop = frame[max(0, cy-half):min(h, cy+half), max(0, cx-half):min(w, cx+half)]
@@ -186,13 +252,13 @@ class RunwayInference:
         # Warm-up
         for _ in range(3):
             with torch.inference_mode():
-                _ = self.model(self._static_input, None)
+                _ = self.model(self._static_input)
         torch.cuda.synchronize()
         # Capture
         self._cuda_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._cuda_graph):
             with torch.inference_mode():
-                self._static_output = self.model(self._static_input, None)
+                self._static_output = self.model(self._static_input)
 
     def _infer(self, img_tensor):
         """Run model inference, using CUDA graph replay when available."""
@@ -202,7 +268,7 @@ class RunwayInference:
             return self._static_output
         else:
             with torch.inference_mode():
-                return self.model(img_tensor, None)
+                return self.model(img_tensor)
 
     def _postprocess(self, outputs, crop_info):
         """Map model outputs from [-1,1] crop space to original image pixels.
@@ -298,101 +364,6 @@ class RunwayInference:
             return state
         return None
 
-    def _fit_edge_lines(self, edge_hm, crop_info):
-        """Fit left/right edge line parameters from heatmaps.
-
-        Args:
-            edge_hm: (2, 256, 256) edge heatmaps [left, right]
-            crop_info: dict with cx, cy, half
-
-        Returns:
-            dict with 'left' and 'right' line params (a, b, c) in original pixel coords
-        """
-        cx, cy, half = crop_info["cx"], crop_info["cy"], crop_info["half"]
-        lines = {}
-        for idx, label in enumerate(['left', 'right']):
-            hm = edge_hm[idx]
-            line = self._fit_line_from_heatmap(hm)
-            if line is not None:
-                # Map from crop [0, 255] to original image coords
-                # crop_x_pixel = (hm_x * 2*half / 256) + (cx - half)
-                scale = 2.0 * half / 256.0
-                offset_x = cx - half
-                offset_y = cy - half
-                # Map line params: a*x + b*y + c = 0
-                # x_orig = scale * x_crop + offset_x
-                # y_orig = scale * y_crop + offset_y
-                # => a*scale*x_crop + a*offset_x + b*scale*y_crop + b*offset_y + c = 0
-                # => a_orig*x_orig + b_orig*y_orig + c_orig = 0
-                a, b, c = line
-                a_orig = a / scale
-                b_orig = b / scale
-                c_orig = c - a * offset_x / scale - b * offset_y / scale
-                lines[label] = (a_orig, b_orig, c_orig)
-            else:
-                lines[label] = None
-        return lines
-
-    def _fit_centerline(self, cl_hm, crop_info):
-        """Fit centerline from heatmap. Returns (a, b, c) in original pixel coords."""
-        line = self._fit_line_from_heatmap(cl_hm[0])
-        if line is None:
-            return None
-        cx, cy, half = crop_info["cx"], crop_info["cy"], crop_info["half"]
-        a, b, c = line
-        scale = 2.0 * half / 256.0
-        offset_x = cx - half
-        offset_y = cy - half
-        a_orig = a / scale
-        b_orig = b / scale
-        c_orig = c - a * offset_x / scale - b * offset_y / scale
-        return (a_orig, b_orig, c_orig)
-
-    @staticmethod
-    def _fit_line_from_heatmap(hm, threshold=0.3):
-        """Fit line params (a, b, c) from heatmap using weighted PCA.
-
-        Args:
-            hm: (H, W) float heatmap
-            threshold: minimum value to consider a pixel
-
-        Returns:
-            (a, b, c) or None if not enough points
-        """
-        ys, xs = np.where(hm > threshold)
-        if len(ys) < 10:
-            return None
-        weights = hm[ys, xs]
-        total_w = weights.sum()
-        if total_w < 1e-6:
-            return None
-        # Weighted centroid
-        cx = (xs * weights).sum() / total_w
-        cy = (ys * weights).sum() / total_w
-        # Weighted covariance
-        dx = xs - cx
-        dy = ys - cy
-        cov_xx = (dx * dx * weights).sum() / total_w
-        cov_yy = (dy * dy * weights).sum() / total_w
-        cov_xy = (dx * dy * weights).sum() / total_w
-        # PCA: direction is eigenvector of [[cov_xx, cov_xy], [cov_xy, cov_yy]]
-        # Normal direction is perpendicular
-        trace = cov_xx + cov_yy
-        det = cov_xx * cov_yy - cov_xy * cov_xy
-        if det < 1e-12:
-            return None
-        # Eigenvalue for line direction (larger)
-        eigval = trace / 2.0 + np.sqrt(max(0, trace**2 / 4.0 - det))
-        # Normal vector (a, b) is eigenvector of smaller eigenvalue
-        a = cov_xy
-        b = eigval - cov_xx
-        norm = np.sqrt(a**2 + b**2)
-        if norm < 1e-8:
-            return None
-        a, b = a / norm, b / norm
-        c = -(a * cx + b * cy)
-        return (a, b, c)
-
     def _predict_corners_from_state(self) -> Optional[np.ndarray]:
         if not self._ekf_initialized:
             return None
@@ -406,3 +377,16 @@ class RunwayInference:
         # Re-capture CUDA graph (needed if model weights were updated)
         if self.device.type == "cuda":
             self._capture_cuda_graph()
+
+    @staticmethod
+    def _line_from_points(p1: np.ndarray, p2: np.ndarray):
+        """Line params (a, b, c) through two points, a*x + b*y + c = 0."""
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        a, b = -dy, dx
+        norm = np.sqrt(a**2 + b**2)
+        if norm < 1e-8:
+            return None
+        a, b = a / norm, b / norm
+        c = -(a * p1[0] + b * p1[1])
+        return (a, b, c)

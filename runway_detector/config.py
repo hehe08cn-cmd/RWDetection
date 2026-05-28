@@ -4,6 +4,7 @@ import os
 # Paths
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = ROOT_DIR
+HDD2_DIR = "/home/hehe/hdd2_disk"
 CHECKPOINT_DIR = os.path.join(ROOT_DIR, "checkpoints")
 LOG_DIR = os.path.join(ROOT_DIR, "logs")
 
@@ -20,6 +21,16 @@ POSES = {
     "video2": os.path.join(DATA_DIR, "A330 - 2025-06-05 01.14.58.txt"),
     "video3": os.path.join(DATA_DIR, "A330 - 2025-06-05 10.05.15.txt"),
 }
+
+# ---- New test data from hdd2_disk ----
+_NEW_VIDEOS = sorted(
+    f.replace(".avi", "") for f in os.listdir(HDD2_DIR)
+    if f.endswith(".avi") and os.path.exists(os.path.join(HDD2_DIR, f.replace(".avi", ".txt")))
+)
+for i, name in enumerate(_NEW_VIDEOS):
+    key = f"video{i+4}"  # video4, video5, ...
+    VIDEOS[key] = os.path.join(HDD2_DIR, name + ".avi")
+    POSES[key] = os.path.join(HDD2_DIR, name + ".txt")
 
 # Train/test split
 TRAIN_VIDEOS = ["video1", "video2", "video3"]
@@ -70,7 +81,7 @@ LOSS_WEIGHTS = {
 }
 
 # Mode switching
-FAR_FIELD_ALTITUDE_THRESHOLD = 30.0  # meters AGL
+FAR_FIELD_ALTITUDE_THRESHOLD = 100.0  # meters AGL
 NEAR_FIELD_ALTITUDE_THRESHOLD = 30.0
 
 # Inference

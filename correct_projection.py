@@ -254,7 +254,180 @@ class RunwayProjector:
             projected[corner_name] = corner_pixel
         
         return projected
-    
+
+    def _fit_line_params(self, pts: np.ndarray) -> tuple:
+        """Fit line (a, b, c) with a*x + b*y + c = 0, a^2 + b^2 = 1.
+
+        Uses total least squares (PCA) — robust for all orientations.
+        """
+        mean = pts.mean(axis=0)
+        cov = (pts - mean).T @ (pts - mean)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        normal = eigenvectors[:, 0]  # smallest eigenvalue = normal direction
+        a, b = normal
+        c = -(a * mean[0] + b * mean[1])
+        n = np.sqrt(a*a + b*b)
+        return (a/n, b/n, c/n)
+
+    def _clip_line_to_image(self, line, img_w, img_h):
+        """Intersect line (a,b,c) with image boundaries. Returns (p0, p1) endpoints."""
+        a, b, c = line
+        pts = []
+        # Intersections with y=0 and y=img_h-1
+        for y in [0, img_h - 1]:
+            if abs(a) > 1e-8:
+                x = -(b*y + c) / a
+                if 0 <= x < img_w:
+                    pts.append(np.array([x, y]))
+        # Intersections with x=0 and x=img_w-1
+        for x in [0, img_w - 1]:
+            if abs(b) > 1e-8:
+                y = -(a*x + c) / b
+                if 0 <= y < img_h:
+                    pts.append(np.array([x, y]))
+        if len(pts) >= 2:
+            return pts[0], pts[1]
+        return None, None
+
+    def project_edge_lines(self, aircraft_pose: dict, n_samples: int = 50) -> dict:
+        """Project runway edge lines (left, right, center) to image pixels.
+
+        Samples points along each edge in ENU space, projects through the
+        camera pipeline. For edges partially outside the image (close-range),
+        fits a 2D line through valid projected points and extrapolates to
+        image boundaries.
+
+        Args:
+            aircraft_pose: dict with latitude, longitude, altitude, yaw, pitch, roll
+            n_samples: number of sample points along each edge
+
+        Returns:
+            dict with:
+                'left': (N, 2) projected pixels for left edge (BL→TL)
+                'right': (N, 2) projected pixels for right edge (BR→TR)
+                'center': (N, 2) projected pixels for centerline
+                'top': (N, 2) projected pixels for top edge (TL→TR)
+                'bottom': (N, 2) projected pixels for bottom edge (BL→BR)
+                'edge_line_params': {name: (a,b,c)} fitted line parameters
+                'edge_segments': {name: (p0, p1)} image-clipped line segments
+                Each sample array is None if < 2 valid projected points.
+        """
+        lat_origin = aircraft_pose['latitude']
+        lon_origin = aircraft_pose['longitude']
+        alt_origin = aircraft_pose['altitude']
+        yaw_deg = aircraft_pose['yaw']
+        pitch_deg = aircraft_pose['pitch']
+        roll_deg = aircraft_pose['roll']
+
+        camera_params = np.array([
+            self.camera_params['fx'], self.camera_params['fy'],
+            self.camera_params['cx'], self.camera_params['cy'],
+        ])
+        t_cam = np.array([
+            self.camera_mounting['offset_x'],
+            self.camera_mounting['offset_y'],
+            self.camera_mounting['offset_z'],
+        ])
+        img_w = int(self.camera_params['width'])
+        img_h = int(self.camera_params['height'])
+
+        # Project 4 corners to ENU
+        corners_enu = {}
+        for corner in self.corners_ecef:
+            enu = self.transformer.ecef_to_enu(
+                corner['pos'], lat_origin, lon_origin, alt_origin)
+            corners_enu[corner['name']] = enu
+
+        def project_enu_point(enu):
+            cam = self.transformer.enu_to_body_to_camera(
+                enu, yaw_deg, pitch_deg, roll_deg, t_cam)
+            # Reject points behind camera (camera_to_pixel returns [-1,-1] sentinel)
+            if cam[2] <= 0:
+                return None
+            px = self.transformer.camera_to_pixel(cam, camera_params)
+            # Reject points wildly outside frame (Z near 0 → extreme pixels)
+            margin = 200
+            if (-margin <= px[0] < img_w + margin and
+                -margin <= px[1] < img_h + margin):
+                return px
+            return None
+
+        def sample_edge(p1, p2):
+            samples = np.linspace(p1, p2, n_samples)
+            pixels = []
+            for s in samples:
+                px = project_enu_point(s)
+                if px is not None:
+                    pixels.append(px)
+            if len(pixels) >= 2:
+                return np.array(pixels)
+            return None
+
+        bl, tl = corners_enu['bottom_left'], corners_enu['top_left']
+        br, tr = corners_enu['bottom_right'], corners_enu['top_right']
+
+        result = {
+            'left': sample_edge(bl, tl),
+            'right': sample_edge(br, tr),
+            'top': sample_edge(tl, tr),
+            'bottom': sample_edge(bl, br),
+            'center': sample_edge((bl + br) / 2.0, (tl + tr) / 2.0),
+        }
+
+        # Fit line params for all edges
+        edge_line_params = {}
+        for edge_name in ['left', 'right', 'center', 'top', 'bottom']:
+            pts = result.get(edge_name)
+            if pts is not None and len(pts) >= 2:
+                edge_line_params[edge_name] = self._fit_line_params(pts)
+
+        # Clip along-runway edges (left/right/center) to the runway region
+        # bounded by top edge (TL-TR) and bottom edge (BL-BR).
+        edge_segments = {}
+
+        def intersect_lines(l1, l2):
+            """Intersection of two lines (a,b,c). Returns point or None if parallel."""
+            a1, b1, c1 = l1
+            a2, b2, c2 = l2
+            det = a1 * b2 - a2 * b1
+            if abs(det) < 1e-8:
+                return None
+            x = (b1 * c2 - b2 * c1) / det
+            y = (c1 * a2 - c2 * a1) / det
+            return np.array([x, y])
+
+        top_line = edge_line_params.get('top')
+        bot_line = edge_line_params.get('bottom')
+
+        for edge_name in ['left', 'right', 'center']:
+            eline = edge_line_params.get(edge_name)
+            if eline is None:
+                continue
+            p_top = intersect_lines(eline, top_line) if top_line else None
+            p_bot = intersect_lines(eline, bot_line) if bot_line else None
+
+            # Fall back to image bottom if bottom boundary unavailable
+            if p_bot is None:
+                if abs(eline[0]) > 1e-8:
+                    x_bot = -(eline[1] * (img_h - 1) + eline[2]) / eline[0]
+                    p_bot = np.array([x_bot, float(img_h - 1)])
+                else:
+                    p_bot = None
+
+            if p_top is not None and p_bot is not None:
+                edge_segments[edge_name] = (p_top, p_bot)
+
+        # Top and bottom edges keep their existing sample-based segments
+        for edge_name in ['top', 'bottom']:
+            pts = result.get(edge_name)
+            if pts is not None and len(pts) >= 2:
+                p0, p1 = pts[0], pts[-1]
+                edge_segments[edge_name] = (p0, p1)
+
+        result['edge_line_params'] = edge_line_params
+        result['edge_segments'] = edge_segments
+        return result
+
     def solve_pnp_for_camera_pose(self, projected_corners: dict, runway_gps_corners: list = None, known_aircraft_pose: dict = None, debug_print: bool = False) -> dict:
         """
         Use PnP algorithm to estimate aircraft pose and position directly from projected runway corners
@@ -484,29 +657,61 @@ class RunwayProjector:
             except:
                 pass
 
-    def draw_corners(self, image: np.ndarray, projected: Dict[str, Optional[np.ndarray]], 
-                    pnp_results: dict = None, aircraft_pose: dict = None) -> np.ndarray:
+    def draw_corners(self, image: np.ndarray, projected: Dict[str, Optional[np.ndarray]],
+                    pnp_results: dict = None, aircraft_pose: dict = None,
+                    edge_lines: dict = None) -> np.ndarray:
         """Draw projected corners on image with PnP comparison"""
         result = image.copy()
-        
-        # Connect visible corners to form runway outline
+
         order = ['bottom_left', 'top_left', 'top_right', 'bottom_right']
-        points = [projected[name].astype(int) for name in order if projected.get(name) is not None]
-        
-        if len(points) >= 2:
-            for i in range(len(points)):
-                cv2.line(result, points[i], points[(i+1)%len(points)], (0, 255, 255), 2)
-        
-        # Draw corner points
+
+        def is_valid(p):
+            return p is not None and p[0] >= 0 and p[1] >= 0
+
+        def safe_int(pt, max_val=50000):
+            """Clamp to avoid OpenCV overflow, return None if extreme."""
+            x, y = int(pt[0]), int(pt[1])
+            if abs(x) > max_val or abs(y) > max_val:
+                return None
+            return (x, y)
+
+        # Draw projected edge lines (if provided)
+        if edge_lines:
+            edge_colors = {
+                'left': (255, 80, 80), 'right': (80, 80, 255),
+                'center': (80, 255, 80), 'top': (255, 255, 80),
+                'bottom': (255, 255, 80),
+            }
+            # Draw full-length extrapolated segments (close-range fix)
+            segments = edge_lines.get('edge_segments', {})
+            for edge_name, color in edge_colors.items():
+                seg = segments.get(edge_name)
+                if seg is not None:
+                    p0 = safe_int(seg[0])
+                    p1 = safe_int(seg[1])
+                    if p0 is not None and p1 is not None:
+                        cv2.line(result, p0, p1, color, thickness=2)
+            # Also draw sampled points as dots for debugging
+            for edge_name, color in edge_colors.items():
+                pts = edge_lines.get(edge_name)
+                if pts is not None and len(pts) >= 2:
+                    for i in range(len(pts) - 1):
+                        p0 = safe_int(pts[i])
+                        p1 = safe_int(pts[i + 1])
+                        if p0 is not None and p1 is not None:
+                            cv2.line(result, p0, p1, color, thickness=1)
+
+        # Draw corner points (only valid ones, skip behind-camera corners)
         for i, name in enumerate(order):
-            if projected.get(name) is not None:
+            p = projected.get(name)
+            if is_valid(p):
                 color = self.colors[name]
-                cv2.circle(result, projected[name].astype(int), 5, color, -1)
-                self.put_text_safe(result, name, projected[name].astype(int) + np.array([10, -10]), 
+                cv2.circle(result, p.astype(int), 5, color, -1)
+                self.put_text_safe(result, name, p.astype(int) + np.array([10, -10]),
                                  font_scale=0.5, color=color)
-        
+
         # Show visible corner count
-        visible_count = sum(1 for p in projected.values() if p is not None)
+        visible_count = sum(1 for p in projected.values() if is_valid(p))
         self.put_text_safe(result, f"Visible: {visible_count}/4", (10, 25), 
                           font_scale=0.6, color=(255, 255, 255))
         
@@ -880,23 +1085,27 @@ def main():
         if pose_idx < len(poses) and poses[pose_idx]['frame'] == frame_idx:
             pose = poses[pose_idx]
             projected = projector.project_corners(pose, debug_print=(frame_idx < 10))
-            
+
+            # Project runway edge lines (left/right/center/top/bottom)
+            edge_lines = projector.project_edge_lines(pose)
+
             # Solve PnP to estimate camera pose and compare with true pose
             pnp_results = projector.solve_pnp_for_camera_pose(
-                projected, 
+                projected,
                 runway_gps_corners=None,  # Use default runway corners
                 debug_print=(frame_idx < 10),
                 known_aircraft_pose=pose  # Pass known pose for error analysis
             )
-            
+
             # Compare estimated with real aircraft pose and position
             comparison_results = projector.compare_estimated_with_real(
                 real_aircraft_pose=pose,
                 estimated_results=pnp_results,
                 debug_print=(frame_idx < 10)
             )
-            
-            frame = projector.draw_corners(frame, projected, pnp_results, pose)
+
+            frame = projector.draw_corners(frame, projected, pnp_results, pose,
+                                           edge_lines=edge_lines)
         
         cv2.imshow('Runway Projection', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
